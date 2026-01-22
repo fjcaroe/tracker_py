@@ -61,17 +61,16 @@ def start_session(
     db.commit()
     db.refresh(session_obj)
     return session_obj
+
 @router.get("/sessions/search", response_model=List[SessionSummaryOut])
 def search_sessions(
     # rango: inclusive en from, exclusive en to (patrón típico)
     date_from: datetime = Query(..., alias="from"),
     date_to: datetime = Query(..., alias="to"),
-
     limit: int = 200,
-    status: TrackingStatus | None = None,
+    status: Optional[str] = Query(None),
     cost_center_id: int | None = None,
     machine_id: int | None = None,
-
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
@@ -123,7 +122,10 @@ def search_sessions(
 
     # filtros opcionales
     if status is not None:
-        q = q.filter(TrackingSession.status == status)
+        status_norm = status.strip().lower()
+        if status_norm not in ("open", "closed"):
+            raise HTTPException(status_code=400, detail="Invalid status. Use: open|closed")
+        q = q.filter(TrackingSession.status == status_norm)
 
     if cost_center_id is not None:
         if not current.is_admin:
@@ -183,7 +185,7 @@ def search_sessions(
     return out
 
 
-@router.post("/sessions/{session_id::uuid}/points")
+@router.post("/sessions/{session_id:uuid}/points")
 def add_points(session_id: uuid.UUID, payload: PointsBatchIn, db: Session = Depends(get_db)):
     session = db.query(TrackingSession).get(session_id)
     if not session:
@@ -210,7 +212,7 @@ def add_points(session_id: uuid.UUID, payload: PointsBatchIn, db: Session = Depe
     return {"inserted": len(payload.points)}
 
 
-@router.post("/sessions/{session_id::uuid}/close", response_model=TrackingSessionOut)
+@router.post("/sessions/{session_id:uuid}/close", response_model=TrackingSessionOut)
 def close_session(session_id: uuid.UUID, ended_at: Optional[datetime] = None, db: Session = Depends(get_db)):
     session_obj = db.query(TrackingSession).get(session_id)
     if not session_obj:
