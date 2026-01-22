@@ -2,10 +2,14 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel, ConfigDict, Field as PydanticField
+from fastapi import Query
 
 from app.models.enums import TrackingStatus
 
-
+class SessionsDayOut(BaseModel):
+    day: str
+    points_count: int
+    sessions_count: int
 class SessionStart(BaseModel):
     machine_id: int
     driver_id: Optional[int] = None
@@ -15,7 +19,7 @@ class SessionStart(BaseModel):
 
 
 class TrackingPointIn(BaseModel):
-    timestamp: datetime = PydanticField(..., alias="ts")
+    timestamp: datetime = PydanticField(..., alias="ts")    
     lat: float
     lon: float
     speed_mps: Optional[float] = None

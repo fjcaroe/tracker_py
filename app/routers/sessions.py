@@ -18,6 +18,7 @@ from app.models.cost_centers import CostCenter
 from app.models.work_orders import WorkOrder
 from app.models.activities import Labor
 from app.schemas.sessions import (
+    SessionsDayOut,
     SessionStart,
     TrackingSessionOut,
     PointsBatchIn,
@@ -182,6 +183,75 @@ def search_sessions(
         )
     return out
 
+@router.get("/sessions/days", response_model=List[SessionsDayOut])
+def sessions_days(
+    date_from: datetime = Query(..., alias="from"),
+    date_to: datetime = Query(..., alias="to"),
+    machine_id: int | None = None,
+    cost_center_id: int | None = None,
+    status: TrackingStatus | None = None,
+    tz: str = "America/Santiago",
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    if date_to <= date_from:
+        raise HTTPException(status_code=400, detail="'to' must be greater than 'from'")
+
+    # Base query de sesiones en rango (tabla chica)
+    sq = db.query(TrackingSession.id)
+
+    # Recomendación: filtra por OVERLAP real (sesiones que tocan el rango),
+    # no solo started_at. Esto incluye sesiones largas abiertas.
+    sq = sq.filter(TrackingSession.started_at < date_to)
+    sq = sq.filter(func.coalesce(TrackingSession.ended_at, func.now()) >= date_from)
+
+    if machine_id is not None:
+        sq = sq.filter(TrackingSession.machine_id == machine_id)
+
+    # permisos (por cost center)
+    if not current.is_admin:
+        allowed_ids = allowed_cost_center_ids(db, current.id)
+        if not allowed_ids:
+            return []
+        sq = sq.filter(TrackingSession.cost_center_id.in_(allowed_ids))
+
+    if cost_center_id is not None:
+        if not current.is_admin:
+            allowed_ids = set(allowed_cost_center_ids(db, current.id))
+            if cost_center_id not in allowed_ids:
+                raise HTTPException(status_code=403, detail="Not allowed cost center")
+        sq = sq.filter(TrackingSession.cost_center_id == cost_center_id)
+
+    if status is not None:
+        sq = sq.filter(TrackingSession.status == status)
+
+    session_ids_subq = sq.subquery()
+
+    # Agrupar puntos por día local (timezone)
+    local_day = func.date(func.timezone(tz, TrackingPoint.ts))
+
+    rows = (
+        db.query(
+            local_day.label("day"),
+            func.count(TrackingPoint.id).label("points_count"),
+            func.count(distinct(TrackingPoint.session_id)).label("sessions_count"),
+        )
+        .filter(TrackingPoint.session_id.in_(session_ids_subq))
+        .filter(TrackingPoint.ts >= date_from)
+        .filter(TrackingPoint.ts < date_to)
+        .group_by(local_day)
+        .order_by(local_day.asc())
+        .all()
+    )
+
+    return [
+        SessionsDayOut(
+            day=r.day.isoformat(),
+            points_count=int(r.points_count or 0),
+            sessions_count=int(r.sessions_count or 0),
+        )
+        for r in rows
+    ]
 
 @router.post("/sessions/{session_id:uuid}/points")
 def add_points(session_id: uuid.UUID, payload: PointsBatchIn, db: Session = Depends(get_db)):
