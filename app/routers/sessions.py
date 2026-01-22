@@ -61,9 +61,129 @@ def start_session(
     db.commit()
     db.refresh(session_obj)
     return session_obj
+@router.get("/sessions/search", response_model=List[SessionSummaryOut])
+def search_sessions(
+    # rango: inclusive en from, exclusive en to (patrón típico)
+    date_from: datetime = Query(..., alias="from"),
+    date_to: datetime = Query(..., alias="to"),
+
+    limit: int = 200,
+    status: TrackingStatus | None = None,
+    cost_center_id: int | None = None,
+    machine_id: int | None = None,
+
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    if date_to <= date_from:
+        raise HTTPException(status_code=400, detail="'to' must be greater than 'from'")
+
+    subq = (
+        db.query(
+            TrackingPoint.session_id.label("session_id"),
+            func.count(TrackingPoint.id).label("points_count"),
+        )
+        .group_by(TrackingPoint.session_id)
+        .subquery()
+    )
+
+    q = (
+        db.query(
+            TrackingSession,
+            Machine.name.label("machine_name"),
+            Driver.name.label("driver_name"),
+            CostCenter.name.label("cost_center_name"),
+            func.coalesce(subq.c.points_count, 0).label("points_count"),
+            WorkOrder.id.label("work_order_id"),
+            WorkOrder.labor_id.label("labor_id"),
+            Labor.effort_factor.label("effort_factor"),
+            Labor.target_speed_kmh.label("target_speed_kmh"),
+            Machine.fuel_consumption_lph.label("machine_lph"),
+            Machine.fuel_consumption_lpkm.label("machine_lpkm"),
+        )
+        .outerjoin(Machine, TrackingSession.machine_id == Machine.id)
+        .outerjoin(Driver, TrackingSession.driver_id == Driver.id)
+        .outerjoin(CostCenter, TrackingSession.cost_center_id == CostCenter.id)
+        .outerjoin(subq, subq.c.session_id == TrackingSession.id)
+        .outerjoin(WorkOrder, TrackingSession.work_order_id == WorkOrder.id)
+        .outerjoin(Labor, WorkOrder.labor_id == Labor.id)
+        # filtro principal por fecha: sessions cuyo started_at cae en el rango
+        .filter(TrackingSession.started_at >= date_from)
+        .filter(TrackingSession.started_at < date_to)
+        .order_by(TrackingSession.started_at.desc())
+        .limit(limit)
+    )
+
+    # permisos
+    if not current.is_admin:
+        allowed_ids = allowed_cost_center_ids(db, current.id)
+        if not allowed_ids:
+            return []
+        q = q.filter(TrackingSession.cost_center_id.in_(allowed_ids))
+
+    # filtros opcionales
+    if status is not None:
+        q = q.filter(TrackingSession.status == status)
+
+    if cost_center_id is not None:
+        if not current.is_admin:
+            allowed_ids = set(allowed_cost_center_ids(db, current.id))
+            if cost_center_id not in allowed_ids:
+                raise HTTPException(status_code=403, detail="Not allowed cost center")
+        q = q.filter(TrackingSession.cost_center_id == cost_center_id)
+
+    if machine_id is not None:
+        q = q.filter(TrackingSession.machine_id == machine_id)
+
+    rows = q.all()
+
+    out: List[SessionSummaryOut] = []
+    for (
+        s, machine_name, driver_name, cost_center_name, points_count,
+        work_order_id, labor_id, effort_factor, target_speed_kmh,
+        machine_lph, machine_lpkm
+    ) in rows:
+        dur_h = duration_hours(s.started_at, s.ended_at)
+        ef = _f(effort_factor)
+        eff_h = (dur_h * ef) if (dur_h is not None and ef is not None) else None
+
+        total_dist_m = _f(s.total_distance_m)
+        avg_kmh = _f(s.avg_speed_kmh)
+
+        est_fuel = estimate_fuel_liters(
+            duration_h=dur_h,
+            total_distance_m=total_dist_m,
+            machine_lph=_f(machine_lph),
+            machine_lpkm=_f(machine_lpkm),
+            effort_factor=ef,
+        )
+
+        out.append(
+            SessionSummaryOut(
+                id=s.id,
+                machine_id=s.machine_id,
+                machine_name=machine_name,
+                driver_name=driver_name,
+                cost_center_name=cost_center_name,
+                started_at=s.started_at,
+                ended_at=s.ended_at,
+                status=s.status,
+                points_count=int(points_count or 0),
+                work_order_id=work_order_id,
+                labor_id=labor_id,
+                effort_factor=ef,
+                target_speed_kmh=_f(target_speed_kmh),
+                total_distance_m=total_dist_m,
+                avg_speed_kmh=avg_kmh,
+                duration_hours=dur_h,
+                effective_hours=eff_h,
+                estimated_fuel_liters=est_fuel,
+            )
+        )
+    return out
 
 
-@router.post("/sessions/{session_id}/points")
+@router.post("/sessions/{session_id::uuid}/points")
 def add_points(session_id: uuid.UUID, payload: PointsBatchIn, db: Session = Depends(get_db)):
     session = db.query(TrackingSession).get(session_id)
     if not session:
@@ -90,7 +210,7 @@ def add_points(session_id: uuid.UUID, payload: PointsBatchIn, db: Session = Depe
     return {"inserted": len(payload.points)}
 
 
-@router.post("/sessions/{session_id}/close", response_model=TrackingSessionOut)
+@router.post("/sessions/{session_id::uuid}/close", response_model=TrackingSessionOut)
 def close_session(session_id: uuid.UUID, ended_at: Optional[datetime] = None, db: Session = Depends(get_db)):
     session_obj = db.query(TrackingSession).get(session_id)
     if not session_obj:
@@ -130,7 +250,7 @@ def close_session(session_id: uuid.UUID, ended_at: Optional[datetime] = None, db
     return session_obj
 
 
-@router.get("/sessions/{session_id}", response_model=TrackingSessionOut)
+@router.get("/sessions/{session_id:uuid}", response_model=TrackingSessionOut)
 def get_session(
     session_id: uuid.UUID,
     db: Session = Depends(get_db),
@@ -148,7 +268,7 @@ def get_session(
     return s
 
 
-@router.get("/sessions/{session_id}/points", response_model=List[TrackingPointOut])
+@router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
 def get_session_points(
     session_id: uuid.UUID,
     db: Session = Depends(get_db),
@@ -283,7 +403,7 @@ def list_active_sessions(db: Session = Depends(get_db)):
     return result
 
 
-@router.get("/sessions/{session_id}/points_range", response_model=List[TrackingPointOut])
+@router.get("/sessions/{session_id:uuid}/points_range", response_model=List[TrackingPointOut])
 def get_session_points_range(
     session_id: uuid.UUID,
     date_from: datetime = Query(..., alias="from"),
@@ -315,126 +435,6 @@ def get_session_points_range(
         .all()
     )
 
-@router.get("/sessions/search", response_model=List[SessionSummaryOut])
-def search_sessions(
-    # rango: inclusive en from, exclusive en to (patrón típico)
-    date_from: datetime = Query(..., alias="from"),
-    date_to: datetime = Query(..., alias="to"),
-
-    limit: int = 200,
-    status: TrackingStatus | None = None,
-    cost_center_id: int | None = None,
-    machine_id: int | None = None,
-
-    db: Session = Depends(get_db),
-    current: User = Depends(get_current_user),
-):
-    if date_to <= date_from:
-        raise HTTPException(status_code=400, detail="'to' must be greater than 'from'")
-
-    subq = (
-        db.query(
-            TrackingPoint.session_id.label("session_id"),
-            func.count(TrackingPoint.id).label("points_count"),
-        )
-        .group_by(TrackingPoint.session_id)
-        .subquery()
-    )
-
-    q = (
-        db.query(
-            TrackingSession,
-            Machine.name.label("machine_name"),
-            Driver.name.label("driver_name"),
-            CostCenter.name.label("cost_center_name"),
-            func.coalesce(subq.c.points_count, 0).label("points_count"),
-            WorkOrder.id.label("work_order_id"),
-            WorkOrder.labor_id.label("labor_id"),
-            Labor.effort_factor.label("effort_factor"),
-            Labor.target_speed_kmh.label("target_speed_kmh"),
-            Machine.fuel_consumption_lph.label("machine_lph"),
-            Machine.fuel_consumption_lpkm.label("machine_lpkm"),
-        )
-        .outerjoin(Machine, TrackingSession.machine_id == Machine.id)
-        .outerjoin(Driver, TrackingSession.driver_id == Driver.id)
-        .outerjoin(CostCenter, TrackingSession.cost_center_id == CostCenter.id)
-        .outerjoin(subq, subq.c.session_id == TrackingSession.id)
-        .outerjoin(WorkOrder, TrackingSession.work_order_id == WorkOrder.id)
-        .outerjoin(Labor, WorkOrder.labor_id == Labor.id)
-        # filtro principal por fecha: sessions cuyo started_at cae en el rango
-        .filter(TrackingSession.started_at >= date_from)
-        .filter(TrackingSession.started_at < date_to)
-        .order_by(TrackingSession.started_at.desc())
-        .limit(limit)
-    )
-
-    # permisos
-    if not current.is_admin:
-        allowed_ids = allowed_cost_center_ids(db, current.id)
-        if not allowed_ids:
-            return []
-        q = q.filter(TrackingSession.cost_center_id.in_(allowed_ids))
-
-    # filtros opcionales
-    if status is not None:
-        q = q.filter(TrackingSession.status == status)
-
-    if cost_center_id is not None:
-        if not current.is_admin:
-            allowed_ids = set(allowed_cost_center_ids(db, current.id))
-            if cost_center_id not in allowed_ids:
-                raise HTTPException(status_code=403, detail="Not allowed cost center")
-        q = q.filter(TrackingSession.cost_center_id == cost_center_id)
-
-    if machine_id is not None:
-        q = q.filter(TrackingSession.machine_id == machine_id)
-
-    rows = q.all()
-
-    out: List[SessionSummaryOut] = []
-    for (
-        s, machine_name, driver_name, cost_center_name, points_count,
-        work_order_id, labor_id, effort_factor, target_speed_kmh,
-        machine_lph, machine_lpkm
-    ) in rows:
-        dur_h = duration_hours(s.started_at, s.ended_at)
-        ef = _f(effort_factor)
-        eff_h = (dur_h * ef) if (dur_h is not None and ef is not None) else None
-
-        total_dist_m = _f(s.total_distance_m)
-        avg_kmh = _f(s.avg_speed_kmh)
-
-        est_fuel = estimate_fuel_liters(
-            duration_h=dur_h,
-            total_distance_m=total_dist_m,
-            machine_lph=_f(machine_lph),
-            machine_lpkm=_f(machine_lpkm),
-            effort_factor=ef,
-        )
-
-        out.append(
-            SessionSummaryOut(
-                id=s.id,
-                machine_id=s.machine_id,
-                machine_name=machine_name,
-                driver_name=driver_name,
-                cost_center_name=cost_center_name,
-                started_at=s.started_at,
-                ended_at=s.ended_at,
-                status=s.status,
-                points_count=int(points_count or 0),
-                work_order_id=work_order_id,
-                labor_id=labor_id,
-                effort_factor=ef,
-                target_speed_kmh=_f(target_speed_kmh),
-                total_distance_m=total_dist_m,
-                avg_speed_kmh=avg_kmh,
-                duration_hours=dur_h,
-                effective_hours=eff_h,
-                estimated_fuel_liters=est_fuel,
-            )
-        )
-    return out
 # ÚNICA versión "recent" que conservamos (la más completa): /sessions_recent
 @router.get("/sessions_recent", response_model=List[SessionSummaryOut])
 def list_recent_sessions(
