@@ -87,18 +87,18 @@ def search_sessions(
     )
 
     q = (
-        db.query(
-            TrackingSession,
-            Machine.name.label("machine_name"),
-            Driver.name.label("driver_name"),
-            CostCenter.name.label("cost_center_name"),
-            func.coalesce(subq.c.points_count, 0).label("points_count"),
-            WorkOrder.id.label("work_order_id"),
-            WorkOrder.labor_id.label("labor_id"),
-            Labor.effort_factor.label("effort_factor"),
-            Labor.target_speed_kmh.label("target_speed_kmh"),
-            Machine.fuel_consumption_lph.label("machine_lph"),
-            Machine.fuel_consumption_lpkm.label("machine_lpkm"),
+    db.query(
+        TrackingSession,
+        Machine.name.label("machine_name"),
+        Driver.name.label("driver_name"),
+        CostCenter.name.label("cost_center_name"),
+        func.coalesce(subq.c.points_count, 0).label("points_count"),
+        WorkOrder.id.label("work_order_id"),
+        WorkOrder.labor_id.label("labor_id"),
+        Labor.effort_factor.label("effort_factor"),
+        Labor.target_speed_kmh.label("target_speed_kmh"),
+        Machine.fuel_consumption_lph.label("machine_lph"),
+        Machine.fuel_consumption_lpkm.label("machine_lpkm"),
         )
         .outerjoin(Machine, TrackingSession.machine_id == Machine.id)
         .outerjoin(Driver, TrackingSession.driver_id == Driver.id)
@@ -106,11 +106,8 @@ def search_sessions(
         .outerjoin(subq, subq.c.session_id == TrackingSession.id)
         .outerjoin(WorkOrder, TrackingSession.work_order_id == WorkOrder.id)
         .outerjoin(Labor, WorkOrder.labor_id == Labor.id)
-        # filtro principal por fecha: sessions cuyo started_at cae en el rango
         .filter(TrackingSession.started_at >= date_from)
         .filter(TrackingSession.started_at < date_to)
-        .order_by(TrackingSession.started_at.desc())
-        .limit(limit)
     )
 
     # permisos
@@ -122,10 +119,7 @@ def search_sessions(
 
     # filtros opcionales
     if status is not None:
-        status_norm = status.strip().lower()
-        if status_norm not in ("open", "closed"):
-            raise HTTPException(status_code=400, detail="Invalid status. Use: open|closed")
-        q = q.filter(TrackingSession.status == status_norm)
+        q = q.filter(TrackingSession.status == status)
 
     if cost_center_id is not None:
         if not current.is_admin:
@@ -137,7 +131,11 @@ def search_sessions(
     if machine_id is not None:
         q = q.filter(TrackingSession.machine_id == machine_id)
 
+    # al final recién orden y limit
+    q = q.order_by(TrackingSession.started_at.desc()).limit(limit)
+
     rows = q.all()
+
 
     out: List[SessionSummaryOut] = []
     for (
