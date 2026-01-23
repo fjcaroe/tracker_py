@@ -258,7 +258,7 @@ def get_session_points(
     session_id: uuid.UUID,
     from_ts: int | None = Query(None, description="Epoch ms"),
     to_ts: int | None = Query(None, description="Epoch ms"),
-    limit: int = Query(5000, ge=1, le=50000),
+    limit: int = Query(50000, ge=1, le=50000),
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
@@ -486,7 +486,7 @@ def get_session_points_range(
     session_id: uuid.UUID,
     date_from: datetime = Query(..., alias="from"),
     date_to: datetime = Query(..., alias="to"),
-    limit: int = 5000,
+    limit: int = 50000,
 
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
