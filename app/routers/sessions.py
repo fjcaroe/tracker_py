@@ -325,36 +325,38 @@ def _assert_session_allowed(db: Session, current: User, s: TrackingSession) -> N
         raise HTTPException(status_code=403, detail="Not allowed")
 
 @router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
-def list_session_points(
+def get_session_points(
     session_id: uuid.UUID,
-    from_ts: int | None = Query(None, description="Epoch ms (UTC)"),
-    to_ts: int | None = Query(None, description="Epoch ms (UTC)"),
-    limit: int = Query(5000, ge=1, le=50000),
+    from_ts: int | None = Query(None, description="epoch ms (UTC)"),
+    to_ts: int | None = Query(None, description="epoch ms (UTC)"),
+    limit: int = Query(50000, ge=1, le=50000),
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    s = _get_session_or_404(db, session_id)
-    _assert_session_allowed(db, current, s)
+    s = db.query(TrackingSession).get(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if not current.is_admin:
+        allowed_ids = set(allowed_cost_center_ids(db, current.id))
+        if s.cost_center_id is None or s.cost_center_id not in allowed_ids:
+            raise HTTPException(status_code=403, detail="Not allowed")
 
     q = db.query(TrackingPoint).filter(TrackingPoint.session_id == session_id)
 
     if from_ts is not None:
-        from_dt = datetime.fromtimestamp(from_ts / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+        from_dt = datetime.fromtimestamp(from_ts / 1000.0, tz=timezone.utc)
         q = q.filter(TrackingPoint.ts >= from_dt)
 
     if to_ts is not None:
-        to_dt = datetime.fromtimestamp(to_ts / 1000.0, tz=timezone.utc).replace(tzinfo=None)
-        q = q.filter(TrackingPoint.ts <= to_dt)
+        to_dt = datetime.fromtimestamp(to_ts / 1000.0, tz=timezone.utc)
+        q = q.filter(TrackingPoint.ts <= to_dt) 
 
-    # “últimos N” dentro del filtro, pero retorno ascendente
-    sub = q.order_by(TrackingPoint.ts.desc()).limit(limit).subquery()
-    rows = (
-        db.query(TrackingPoint)
-        .select_entity_from(sub)
-        .order_by(sub.c.ts.asc())
-        .all()
+    return (
+        q.order_by(TrackingPoint.ts.asc())
+         .limit(limit)
+         .all()
     )
-    return rows
 
 @router.get("/sessions/my", response_model=List[SessionSummaryOut])
 def my_sessions(
