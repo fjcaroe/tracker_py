@@ -5,7 +5,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-
+from sqlalchemy import distinct
 from app.db.session import get_db
 from app.core.security import get_current_user, allowed_cost_center_ids
 from app.core.utils import haversine_m, _f, duration_hours, estimate_fuel_liters
@@ -405,18 +405,16 @@ def my_sessions(
         .outerjoin(CostCenter, TrackingSession.cost_center_id == CostCenter.id)
         .outerjoin(subq, subq.c.session_id == TrackingSession.id)
         .filter(TrackingSession.cost_center_id.in_(allowed_ids))
-        .order_by(TrackingSession.started_at.desc())
-        .limit(limit)
     )
 
     if status is not None:
         q = q.filter(TrackingSession.status == status)
 
     if cost_center_id is not None:
-        if cost_center_id not in allowed_ids:
-            raise HTTPException(status_code=403, detail="Not allowed cost center")
+        ...
         q = q.filter(TrackingSession.cost_center_id == cost_center_id)
 
+    q = q.order_by(TrackingSession.started_at.desc()).limit(limit)
     rows = q.all()
 
     out: List[SessionSummaryOut] = []
@@ -515,7 +513,6 @@ def get_session_points_range(
         .all()
     )
 
-# ÚNICA versión "recent" que conservamos (la más completa): /sessions_recent
 @router.get("/sessions_recent", response_model=List[SessionSummaryOut])
 def list_recent_sessions(
     limit: int = 50,
@@ -552,8 +549,6 @@ def list_recent_sessions(
         .outerjoin(subq, subq.c.session_id == TrackingSession.id)
         .outerjoin(WorkOrder, TrackingSession.work_order_id == WorkOrder.id)
         .outerjoin(Labor, WorkOrder.labor_id == Labor.id)
-        .order_by(TrackingSession.started_at.desc())
-        .limit(limit)
     )
 
     if not current.is_admin:
@@ -565,6 +560,7 @@ def list_recent_sessions(
     if status is not None:
         q = q.filter(TrackingSession.status == status)
 
+    q = q.order_by(TrackingSession.started_at.desc()).limit(limit)
     rows = q.all()
 
     out: List[SessionSummaryOut] = []
