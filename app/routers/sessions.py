@@ -342,7 +342,7 @@ def ts_to_dt(ts: int) -> datetime:
         return datetime.fromtimestamp(ts, tz=timezone.utc)
     return datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
 
-@app.post("/sessions/{session_id}/points")
+@router.post("/sessions/{session_id}/points")
 def add_points(
     session_id: uuid.UUID,
     payload: PointsBatchIn,
