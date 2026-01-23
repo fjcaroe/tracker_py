@@ -1,5 +1,5 @@
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -253,43 +253,6 @@ def sessions_days(
         for r in rows
     ]
 
-@router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
-def get_session_points(
-    session_id: uuid.UUID,
-    from_ts: int | None = Query(None, description="Epoch ms"),
-    to_ts: int | None = Query(None, description="Epoch ms"),
-    limit: int = Query(50000, ge=1, le=50000),
-    db: Session = Depends(get_db),
-    current: User = Depends(get_current_user),
-):
-    s = db.query(TrackingSession).get(session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    if not current.is_admin:
-        allowed_ids = set(allowed_cost_center_ids(db, current.id))
-        if s.cost_center_id is None or s.cost_center_id not in allowed_ids:
-            raise HTTPException(status_code=403, detail="Not allowed")
-
-    q = db.query(TrackingPoint).filter(TrackingPoint.session_id == session_id)
-
-    if from_ts is not None:
-        from_dt = datetime.fromtimestamp(from_ts / 1000, tz=timezone.utc).replace(tzinfo=None)
-        q = q.filter(TrackingPoint.ts >= from_dt)
-
-    if to_ts is not None:
-        to_dt = datetime.fromtimestamp(to_ts / 1000, tz=timezone.utc).replace(tzinfo=None)
-        q = q.filter(TrackingPoint.ts <= to_dt)
-
-    rows = (
-        q.order_by(TrackingPoint.ts.desc())
-         .limit(limit)
-         .all()
-    )
-    rows.sort(key=lambda r: r.ts) 
-    return rows
-
-
 @router.post("/sessions/{session_id:uuid}/close", response_model=TrackingSessionOut)
 def close_session(session_id: uuid.UUID, ended_at: Optional[datetime] = None, db: Session = Depends(get_db)):
     session_obj = db.query(TrackingSession).get(session_id)
@@ -348,28 +311,50 @@ def get_session(
     return s
 
 
-@router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
-def get_session_points(
-    session_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current: User = Depends(get_current_user),
-):
+def _get_session_or_404(db: Session, session_id: uuid.UUID) -> TrackingSession:
     s = db.query(TrackingSession).get(session_id)
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
+    return s
 
-    if not current.is_admin:
-        allowed_ids = set(allowed_cost_center_ids(db, current.id))
-        if s.cost_center_id is None or s.cost_center_id not in allowed_ids:
-            raise HTTPException(status_code=403, detail="Not allowed")
+def _assert_session_allowed(db: Session, current: User, s: TrackingSession) -> None:
+    if current.is_admin:
+        return
+    allowed_ids = set(allowed_cost_center_ids(db, current.id))
+    if s.cost_center_id is None or s.cost_center_id not in allowed_ids:
+        raise HTTPException(status_code=403, detail="Not allowed")
 
-    return (
+@router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
+def list_session_points(
+    session_id: uuid.UUID,
+    from_ts: int | None = Query(None, description="Epoch ms (UTC)"),
+    to_ts: int | None = Query(None, description="Epoch ms (UTC)"),
+    limit: int = Query(5000, ge=1, le=50000),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    s = _get_session_or_404(db, session_id)
+    _assert_session_allowed(db, current, s)
+
+    q = db.query(TrackingPoint).filter(TrackingPoint.session_id == session_id)
+
+    if from_ts is not None:
+        from_dt = datetime.fromtimestamp(from_ts / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+        q = q.filter(TrackingPoint.ts >= from_dt)
+
+    if to_ts is not None:
+        to_dt = datetime.fromtimestamp(to_ts / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+        q = q.filter(TrackingPoint.ts <= to_dt)
+
+    # “últimos N” dentro del filtro, pero retorno ascendente
+    sub = q.order_by(TrackingPoint.ts.desc()).limit(limit).subquery()
+    rows = (
         db.query(TrackingPoint)
-        .filter(TrackingPoint.session_id == session_id)
-        .order_by(TrackingPoint.ts.asc())
+        .select_entity_from(sub)
+        .order_by(sub.c.ts.asc())
         .all()
     )
-
+    return rows
 
 @router.get("/sessions/my", response_model=List[SessionSummaryOut])
 def my_sessions(
@@ -406,7 +391,6 @@ def my_sessions(
         .outerjoin(subq, subq.c.session_id == TrackingSession.id)
         .filter(TrackingSession.cost_center_id.in_(allowed_ids))
     )
-
     if status is not None:
         q = q.filter(TrackingSession.status == status)
 
@@ -550,7 +534,8 @@ def list_recent_sessions(
         .outerjoin(WorkOrder, TrackingSession.work_order_id == WorkOrder.id)
         .outerjoin(Labor, WorkOrder.labor_id == Labor.id)
     )
-
+    if status is not None:
+        q = q.filter(TrackingSession.status == status)
     if not current.is_admin:
         allowed_ids = allowed_cost_center_ids(db, current.id)
         if not allowed_ids:
