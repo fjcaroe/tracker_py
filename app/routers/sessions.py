@@ -253,31 +253,41 @@ def sessions_days(
         for r in rows
     ]
 
-@router.post("/sessions/{session_id:uuid}/points")
-def add_points(session_id: uuid.UUID, payload: PointsBatchIn, db: Session = Depends(get_db)):
-    session = db.query(TrackingSession).get(session_id)
-    if not session:
+@router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
+def get_session_points(
+    session_id: uuid.UUID,
+    from_ts: int | None = Query(None, description="Epoch ms"),
+    to_ts: int | None = Query(None, description="Epoch ms"),
+    limit: int = Query(5000, ge=1, le=50000),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    s = db.query(TrackingSession).get(session_id)
+    if not s:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if session.status != TrackingStatus.open:
-        raise HTTPException(status_code=400, detail="Session is closed; no more points can be recorded.")
+    if not current.is_admin:
+        allowed_ids = set(allowed_cost_center_ids(db, current.id))
+        if s.cost_center_id is None or s.cost_center_id not in allowed_ids:
+            raise HTTPException(status_code=403, detail="Not allowed")
 
-    now = datetime.utcnow()
-    for p in payload.points:
-        point = TrackingPoint(
-            session_id=session_id,
-            ts=p.timestamp,
-            lat=p.lat,
-            lon=p.lon,
-            speed_mps=p.speed_mps,
-            accuracy_m=p.accuracy_m,
-            extra=p.extra,
-            created_at=now,
-        )
-        db.add(point)
+    q = db.query(TrackingPoint).filter(TrackingPoint.session_id == session_id)
 
-    db.commit()
-    return {"inserted": len(payload.points)}
+    if from_ts is not None:
+        from_dt = datetime.fromtimestamp(from_ts / 1000, tz=timezone.utc).replace(tzinfo=None)
+        q = q.filter(TrackingPoint.ts >= from_dt)
+
+    if to_ts is not None:
+        to_dt = datetime.fromtimestamp(to_ts / 1000, tz=timezone.utc).replace(tzinfo=None)
+        q = q.filter(TrackingPoint.ts <= to_dt)
+
+    rows = (
+        q.order_by(TrackingPoint.ts.desc())
+         .limit(limit)
+         .all()
+    )
+    rows.sort(key=lambda r: r.ts) 
+    return rows
 
 
 @router.post("/sessions/{session_id:uuid}/close", response_model=TrackingSessionOut)
