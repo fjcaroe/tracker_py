@@ -14,5 +14,10 @@ class Field(Base):
     color = Column(Text, nullable=True)
     polygon = Column(JSONB, nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    species_id = Column(Integer, ForeignKey("species.id"))
+    variety_id = Column(Integer, ForeignKey("varieties.id"))
+
+    species = relationship("Species")
+    variety = relationship("Variety")
 
     cost_center = relationship("CostCenter")

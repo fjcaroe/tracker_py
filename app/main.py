@@ -15,6 +15,12 @@ from app.routers.cost_centers import router as cost_centers_router
 from app.routers.fields import router as fields_router
 from app.routers.sessions import router as sessions_router
 from app.routers.lots import router as lots_router
+from app.routers.regions import router as regions_router
+from app.routers.communes import router as communes_router
+from app.routers.fundos import router as fundos_router
+from app.routers.sectors import router as sectors_router
+from app.routers.species import router as species_router
+from app.routers.varieties import router as varieties_router
 
 app = FastAPI(title="Tracker Steps API")
 
@@ -35,6 +41,12 @@ app.include_router(work_orders_router)
 app.include_router(machines_router)
 app.include_router(drivers_router)
 app.include_router(cost_centers_router)
+app.include_router(regions_router)
+app.include_router(communes_router)
+app.include_router(fundos_router)
+app.include_router(sectors_router)
+app.include_router(species_router)
+app.include_router(varieties_router)
 app.include_router(fields_router)
 app.include_router(sessions_router)
 app.include_router(lots_router)
