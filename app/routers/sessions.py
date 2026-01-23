@@ -324,6 +324,58 @@ def _assert_session_allowed(db: Session, current: User, s: TrackingSession) -> N
     if s.cost_center_id is None or s.cost_center_id not in allowed_ids:
         raise HTTPException(status_code=403, detail="Not allowed")
 
+from fastapi import Body, Header, Request
+from pydantic import BaseModel
+from typing import List, Optional, Union
+from datetime import datetime, timezone
+import os
+
+class TrackingPointIn(BaseModel):
+    ts: int  # epoch (ms o s)
+    lat: float
+    lon: float
+    speed_mps: Optional[float] = None
+
+def ts_to_dt(ts: int) -> datetime:
+    # si viene en segundos (10 dígitos aprox) conviértelo; si viene en ms, divide por 1000
+    if ts < 10_000_000_000:
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    return datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
+
+@app.post("/sessions/{session_id}/points")
+def add_points(
+    session_id: uuid.UUID,
+    payload: PointsBatchIn,
+    db: Session = Depends(get_db),
+):
+    session = db.query(TrackingSession).get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if session.status != "open":
+        raise HTTPException(
+            status_code=400,
+            detail="Session is closed; no more points can be recorded.",
+        )   
+
+    now = datetime.utcnow()
+    for p in payload.points:
+        point = TrackingPoint(
+            session_id=session_id,
+            ts=p.timestamp,
+            lat=p.lat,
+            lon=p.lon,
+            speed_mps=p.speed_mps,
+            accuracy_m=p.accuracy_m,
+            extra=p.extra,
+            created_at=now,
+        )
+        db.add(point)
+
+    db.commit()
+    return {"inserted": len(payload.points)}
+
+
 @router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
 def get_session_points(
     session_id: uuid.UUID,
