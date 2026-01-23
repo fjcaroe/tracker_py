@@ -24,14 +24,6 @@ from app.routers.varieties import router as varieties_router
 
 app = FastAPI(title="Tracker Steps API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(activities_router)
