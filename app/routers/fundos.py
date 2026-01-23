@@ -9,6 +9,8 @@ from app.schemas.locations import FundoCreate, FundoUpdate, FundoOut
 
 router = APIRouter(prefix="", tags=["fundos"])
 
+from sqlalchemy.exc import IntegrityError, ProgrammingError
+from psycopg2.errors import UniqueViolation
 
 @router.post("/fundos", response_model=FundoOut)
 def create_fundo(payload: FundoCreate, db: Session = Depends(get_db)):
@@ -25,10 +27,19 @@ def create_fundo(payload: FundoCreate, db: Session = Depends(get_db)):
         hectares_total=payload.hectares_total,
         created_at=datetime.utcnow(),
     )
-    db.add(fundo)
-    db.commit()
-    db.refresh(fundo)
-    return fundo
+
+    try:
+        db.add(fundo)
+        db.commit()
+        db.refresh(fundo)
+        return fundo
+    except IntegrityError as e:
+        db.rollback()
+        # nombre duplicado u otras constraints
+        raise HTTPException(status_code=409, detail="Ya existe un fundo con ese nombre.")
+    except ProgrammingError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Error de permisos o configuración de base de datos.")
 
 
 @router.get("/fundos", response_model=List[FundoOut])
