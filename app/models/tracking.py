@@ -1,6 +1,6 @@
 import enum
 import uuid
-from sqlalchemy import Column, Integer, Text, Numeric, TIMESTAMP, Enum, ForeignKey, BigInteger, JSON
+from sqlalchemy import Column, Integer, Text, Numeric, TIMESTAMP, Enum, ForeignKey, BigInteger, JSON, Float 
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.sql import func
@@ -33,7 +33,13 @@ class TrackingSession(Base):
     driver = relationship("Driver")
     cost_center = relationship("CostCenter")
     points = relationship("TrackingPoint", back_populates="session")
-
+    points_count = Column(BigInteger, nullable=False, default=0)
+    last_point_ts = Column(TIMESTAMP(timezone=True))
+    last_lat = Column(Float)
+    last_lon = Column(Float)
+    last_speed_mps = Column(Float)
+    last_accuracy_m = Column(Float)
+    
 class TrackingPoint(Base):
     __tablename__ = "tracking_points"
 
