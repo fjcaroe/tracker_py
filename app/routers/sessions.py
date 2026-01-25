@@ -1,7 +1,12 @@
 from typing import List, Optional
 from datetime import datetime, timezone
 import uuid
-
+from sqlalchemy import text
+from fastapi import Body, Header, Request
+from pydantic import BaseModel
+from typing import List, Optional, Union
+from datetime import datetime, timezone
+import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -354,12 +359,6 @@ def _ensure_dt_utc(ts_value):
     raise ValueError(f"Unsupported timestamp type: {type(ts_value)}")
 
 
-from fastapi import Body, Header, Request
-from pydantic import BaseModel
-from typing import List, Optional, Union
-from datetime import datetime, timezone
-import os
-
 class TrackingPointIn(BaseModel):
     ts: int  # epoch (ms o s)
     lat: float
@@ -388,39 +387,47 @@ def add_points(
             detail="Session is closed; no more points can be recorded.",
         )
 
-    # ---- parámetros ajustables por ENV ----
-    MIN_MOVE_METERS = float(os.getenv("TRACK_MIN_MOVE_METERS", "10"))          # ej: 10m
-    MIN_SPEED_MPS = float(os.getenv("TRACK_MIN_SPEED_MPS", "0.5"))             # ej: 0.5 m/s (~1.8 km/h)
-    MIN_SAVE_INTERVAL_SEC = int(os.getenv("TRACK_MIN_SAVE_INTERVAL_SEC", "3")) # ej: 5s
+    # ---- parámetros por ENV ----
+    MIN_MOVE_METERS = float(os.getenv("TRACK_MIN_MOVE_METERS", "10"))
+    MIN_SPEED_MPS = float(os.getenv("TRACK_MIN_SPEED_MPS", "0.5"))
+    MIN_SAVE_INTERVAL_SEC = int(os.getenv("TRACK_MIN_SAVE_INTERVAL_SEC", "3"))
 
-    # Último punto guardado de la sesión (si existe)
-    last = (
-        db.query(TrackingPoint)
-        .filter(TrackingPoint.session_id == session_id)
-        .order_by(TrackingPoint.ts.desc())
-        .first()
-    )
+    # Baseline: primero intenta desde tracking_sessions.last_*
+    last_ts = session.last_point_ts
+    last_lat = session.last_lat
+    last_lon = session.last_lon
 
-    last_ts = last.ts if last else None
-    last_lat = _to_float(last.lat) if last else None
-    last_lon = _to_float(last.lon) if last else None
+    # Fallback solo si aún no hay last_* (por ejemplo, sesiones antiguas antes de la migración)
+    if last_ts is None or last_lat is None or last_lon is None:
+        last = (
+            db.query(TrackingPoint)
+            .filter(TrackingPoint.session_id == session_id)
+            .order_by(TrackingPoint.ts.desc())
+            .first()
+        )
+        last_ts = last.ts if last else None
+        last_lat = float(last.lat) if last else None
+        last_lon = float(last.lon) if last else None
 
-    # Normaliza/sort por timestamp (por seguridad)
     incoming_points = list(payload.points or [])
     incoming_points.sort(key=lambda p: _ensure_dt_utc(p.timestamp))
 
     now = datetime.utcnow()
 
-    inserted = 0
     received = len(incoming_points)
     skipped_throttle = 0
     skipped_no_move = 0
+
+    rows_to_insert = []
+    inserted = 0
+
+    # Para actualizar last_* al final
+    last_inserted_row = None
 
     for p in incoming_points:
         try:
             p_ts = _ensure_dt_utc(p.timestamp)
         except Exception:
-            # Si viene algo roto, lo saltas para no botar todo el batch
             skipped_no_move += 1
             continue
 
@@ -428,53 +435,99 @@ def add_points(
         p_lon = float(p.lon)
         p_speed = float(p.speed_mps) if (p.speed_mps is not None) else None
 
-        # 1) Si no hay last guardado aún, guarda el primer punto como baseline
+        # 1) Primer punto si no hay baseline
         if last_ts is None:
-            point = TrackingPoint(
-                session_id=session_id,
-                ts=p_ts,
-                lat=p_lat,
-                lon=p_lon,
-                speed_mps=p_speed,
-                accuracy_m=p.accuracy_m,
-                extra=p.extra,
-                created_at=now,
-            )
-            db.add(point)
+            row = {
+                "session_id": session_id,
+                "ts": p_ts,
+                "lat": p_lat,
+                "lon": p_lon,
+                "speed_mps": p_speed,
+                "accuracy_m": p.accuracy_m,
+                "extra": p.extra,
+                "created_at": now,
+            }
+            rows_to_insert.append(row)
             inserted += 1
+            last_inserted_row = row
             last_ts, last_lat, last_lon = p_ts, p_lat, p_lon
             continue
 
-        # 2) Throttle por tiempo desde el último guardado
+        # 2) Throttle por tiempo
         dt_sec = (p_ts - last_ts).total_seconds()
         if dt_sec < MIN_SAVE_INTERVAL_SEC:
             skipped_throttle += 1
             continue
 
-        # 3) Movimiento real: speed o distancia
-        dist_m = haversine_m(last_lat, last_lon, p_lat, p_lon)
+        # 3) Movimiento real
+        dist_m = haversine_m(float(last_lat), float(last_lon), p_lat, p_lon)
         speed_ok = (p_speed is not None) and (p_speed >= MIN_SPEED_MPS)
 
         if dist_m < MIN_MOVE_METERS and not speed_ok:
             skipped_no_move += 1
             continue
 
-        # 4) Guarda punto válido
-        point = TrackingPoint(
-            session_id=session_id,
-            ts=p_ts,
-            lat=p_lat,
-            lon=p_lon,
-            speed_mps=p_speed,
-            accuracy_m=p.accuracy_m,
-            extra=p.extra,
-            created_at=now,
-        )
-        db.add(point)
+        # 4) Punto válido -> lo dejamos en batch
+        row = {
+            "session_id": session_id,
+            "ts": p_ts,
+            "lat": p_lat,
+            "lon": p_lon,
+            "speed_mps": p_speed,
+            "accuracy_m": p.accuracy_m,
+            "extra": p.extra,
+            "created_at": now,
+        }
+        rows_to_insert.append(row)
         inserted += 1
+        last_inserted_row = row
         last_ts, last_lat, last_lon = p_ts, p_lat, p_lon
 
+    # Inserta batch + actualiza stats sesión
+    if inserted > 0:
+        db.bulk_insert_mappings(TrackingPoint, rows_to_insert)
+
+        # Update atómico: suma points_count y actualiza last_* solo si ts es más nuevo
+        db.execute(
+            text("""
+                UPDATE tracking_sessions
+                SET
+                    points_count = points_count + :ins,
+                    last_point_ts = CASE
+                        WHEN last_point_ts IS NULL OR :ts > last_point_ts THEN :ts
+                        ELSE last_point_ts
+                    END,
+                    last_lat = CASE
+                        WHEN last_point_ts IS NULL OR :ts > last_point_ts THEN :lat
+                        ELSE last_lat
+                    END,
+                    last_lon = CASE
+                        WHEN last_point_ts IS NULL OR :ts > last_point_ts THEN :lon
+                        ELSE last_lon
+                    END,
+                    last_speed_mps = CASE
+                        WHEN last_point_ts IS NULL OR :ts > last_point_ts THEN :speed
+                        ELSE last_speed_mps
+                    END,
+                    last_accuracy_m = CASE
+                        WHEN last_point_ts IS NULL OR :ts > last_point_ts THEN :acc
+                        ELSE last_accuracy_m
+                    END
+                WHERE id = :session_id
+            """),
+            {
+                "ins": inserted,
+                "ts": last_inserted_row["ts"],
+                "lat": last_inserted_row["lat"],
+                "lon": last_inserted_row["lon"],
+                "speed": last_inserted_row.get("speed_mps"),
+                "acc": last_inserted_row.get("accuracy_m"),
+                "session_id": str(session_id),
+            }
+        )
+
     db.commit()
+
     return {
         "inserted": inserted,
         "received": received,
@@ -484,7 +537,6 @@ def add_points(
         "min_speed_mps": MIN_SPEED_MPS,
         "min_interval_sec": MIN_SAVE_INTERVAL_SEC,
     }
-
 
 @router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
 def get_session_points(
