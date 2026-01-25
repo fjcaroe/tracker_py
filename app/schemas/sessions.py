@@ -56,6 +56,17 @@ class TrackingPointOut(BaseModel):
     accuracy_m: Optional[float]
     extra: Optional[dict]
 
+class TrackPointOut(BaseModel):
+    ts: datetime
+    lat: float
+    lon: float
+    speed_mps: Optional[float] = None
+    n: int = 1
+
+class TrackResponse(BaseModel):
+    items: List[TrackPointOut]
+    next_cursor: Optional[str] = None
+    resolution: str
 
 class SessionSummaryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)

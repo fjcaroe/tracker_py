@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Union
 from datetime import datetime, timezone
 import os
+import math
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -29,6 +30,8 @@ from app.schemas.sessions import (
     PointsBatchIn,
     SessionSummaryOut,
     TrackingPointOut,
+    TrackPointOut,
+    TrackResponse
 )
 from fastapi import Query
 
@@ -98,7 +101,7 @@ def search_sessions(
         Machine.name.label("machine_name"),
         Driver.name.label("driver_name"),
         CostCenter.name.label("cost_center_name"),
-        func.coalesce(subq.c.points_count, 0).label("points_count"),
+        TrackingSession.points_count.label("points_count"),
         WorkOrder.id.label("work_order_id"),
         WorkOrder.labor_id.label("labor_id"),
         Labor.effort_factor.label("effort_factor"),
@@ -109,7 +112,6 @@ def search_sessions(
         .outerjoin(Machine, TrackingSession.machine_id == Machine.id)
         .outerjoin(Driver, TrackingSession.driver_id == Driver.id)
         .outerjoin(CostCenter, TrackingSession.cost_center_id == CostCenter.id)
-        .outerjoin(subq, subq.c.session_id == TrackingSession.id)
         .outerjoin(WorkOrder, TrackingSession.work_order_id == WorkOrder.id)
         .outerjoin(Labor, WorkOrder.labor_id == Labor.id)
         .filter(TrackingSession.started_at >= date_from)
@@ -538,12 +540,128 @@ def add_points(
         "min_interval_sec": MIN_SAVE_INTERVAL_SEC,
     }
 
+@router.get("/sessions/{session_id:uuid}/track", response_model=TrackResponse)
+def get_session_track(
+    session_id: uuid.UUID,
+    date_from: datetime = Query(..., alias="from"),
+    date_to: datetime = Query(..., alias="to"),
+    resolution: str = Query("raw", pattern="^(raw|10s|1m)$"),
+    limit: int = Query(5000, ge=100, le=20000),
+    cursor: str | None = Query(None, description="ISO timestamp of last item returned"),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    if date_to <= date_from:
+        raise HTTPException(status_code=400, detail="'to' must be greater than 'from'")
+
+    s = db.query(TrackingSession).get(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if not current.is_admin:
+        allowed_ids = set(allowed_cost_center_ids(db, current.id))
+        if s.cost_center_id is None or s.cost_center_id not in allowed_ids:
+            raise HTTPException(status_code=403, detail="Not allowed")
+
+    # cursor -> datetime
+    cursor_dt = None
+    if cursor:
+        try:
+            cursor_dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
+            if cursor_dt.tzinfo is None:
+                cursor_dt = cursor_dt.replace(tzinfo=timezone.utc)
+            else:
+                cursor_dt = cursor_dt.astimezone(timezone.utc)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid cursor format")
+
+    # -------- RAW --------
+    if resolution == "raw":
+        q = db.query(TrackingPoint).filter(TrackingPoint.session_id == session_id)
+        q = q.filter(TrackingPoint.ts >= date_from, TrackingPoint.ts < date_to)
+        if cursor_dt is not None:
+            q = q.filter(TrackingPoint.ts > cursor_dt)
+
+        rows = q.order_by(TrackingPoint.ts.asc()).limit(limit).all()
+
+        items = [
+            TrackPointOut(
+                ts=r.ts,
+                lat=float(r.lat),
+                lon=float(r.lon),
+                speed_mps=float(r.speed_mps) if r.speed_mps is not None else None,
+                n=1,
+            )
+            for r in rows
+        ]
+        next_cursor = items[-1].ts.isoformat().replace("+00:00", "Z") if len(items) == limit else None
+        return TrackResponse(items=items, next_cursor=next_cursor, resolution=resolution)
+
+    # -------- BUCKETS (PG12) --------
+    if resolution == "1m":
+        bucket_expr = "date_trunc('minute', ts)"
+        def bucket_py(dt: datetime) -> datetime:
+            dt = dt.astimezone(timezone.utc)
+            return dt.replace(second=0, microsecond=0)
+    else:  # "10s"
+        bucket_expr = "to_timestamp(floor(extract(epoch from ts) / 10) * 10)"
+        def bucket_py(dt: datetime) -> datetime:
+            dt = dt.astimezone(timezone.utc)
+            sec = math.floor(dt.timestamp() / 10) * 10
+            return datetime.fromtimestamp(sec, tz=timezone.utc)
+
+    cursor_clause = ""
+    params = {
+        "session_id": str(session_id),
+        "from_ts": date_from,
+        "to_ts": date_to,
+        "limit": limit,
+    }
+
+    if cursor_dt is not None:
+        cursor_bucket = bucket_py(cursor_dt)
+        cursor_clause = f"AND {bucket_expr} > :cursor_bucket"
+        params["cursor_bucket"] = cursor_bucket
+
+    sql = f"""
+        SELECT
+            {bucket_expr} AS bucket_ts,
+            AVG(lat)::float8 AS lat,
+            AVG(lon)::float8 AS lon,
+            MAX(speed_mps)::float8 AS speed_mps,
+            COUNT(*)::int AS n
+        FROM tracking_points
+        WHERE session_id = :session_id
+          AND ts >= :from_ts
+          AND ts < :to_ts
+          {cursor_clause}
+        GROUP BY 1
+        ORDER BY 1
+        LIMIT :limit
+    """
+
+    rows = db.execute(text(sql), params).fetchall()
+
+    items = [
+        TrackPointOut(
+            ts=r.bucket_ts,
+            lat=float(r.lat),
+            lon=float(r.lon),
+            speed_mps=float(r.speed_mps) if r.speed_mps is not None else None,
+            n=int(r.n),
+        )
+        for r in rows
+    ]
+
+    next_cursor = items[-1].ts.isoformat().replace("+00:00", "Z") if len(items) == limit else None
+    return TrackResponse(items=items, next_cursor=next_cursor, resolution=resolution)
+
 @router.get("/sessions/{session_id:uuid}/points", response_model=List[TrackingPointOut])
 def get_session_points(
     session_id: uuid.UUID,
     from_ts: int | None = Query(None, description="epoch ms (UTC)"),
     to_ts: int | None = Query(None, description="epoch ms (UTC)"),
-    limit: int = Query(500000, ge=1, le=500000),
+    limit: int = Query(20000, ge=1, le=20000),
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
@@ -584,101 +702,80 @@ def my_sessions(
     if not allowed_ids:
         return []
 
-    subq = (
-        db.query(
-            TrackingPoint.session_id.label("session_id"),
-            func.count(TrackingPoint.id).label("points_count"),
-        )
-        .group_by(TrackingPoint.session_id)
-        .subquery()
-    )
-
     q = (
         db.query(
             TrackingSession,
             Machine.name.label("machine_name"),
             Driver.name.label("driver_name"),
             CostCenter.name.label("cost_center_name"),
-            func.coalesce(subq.c.points_count, 0).label("points_count"),
+            TrackingSession.points_count.label("points_count"),
         )
         .outerjoin(Machine, TrackingSession.machine_id == Machine.id)
         .outerjoin(Driver, TrackingSession.driver_id == Driver.id)
         .outerjoin(CostCenter, TrackingSession.cost_center_id == CostCenter.id)
-        .outerjoin(subq, subq.c.session_id == TrackingSession.id)
         .filter(TrackingSession.cost_center_id.in_(allowed_ids))
     )
+
     if status is not None:
         q = q.filter(TrackingSession.status == status)
 
     if cost_center_id is not None:
-        ...
+        if not current.is_admin:
+            allowed_set = set(allowed_ids)
+            if cost_center_id not in allowed_set:
+                raise HTTPException(status_code=403, detail="Not allowed cost center")
         q = q.filter(TrackingSession.cost_center_id == cost_center_id)
 
-    q = q.order_by(TrackingSession.started_at.desc()).limit(limit)
-    rows = q.all()
+    rows = q.order_by(TrackingSession.started_at.desc()).limit(limit).all()
 
-    out: List[SessionSummaryOut] = []
-    for s, machine_name, driver_name, cost_center_name, points_count in rows:
-        out.append(
-            SessionSummaryOut(
-                id=s.id,
-                machine_id=s.machine_id,
-                machine_name=machine_name,
-                driver_name=driver_name,
-                cost_center_name=cost_center_name,
-                started_at=s.started_at,
-                ended_at=s.ended_at,
-                status=s.status,
-                points_count=int(points_count or 0),
-            )
+    return [
+        SessionSummaryOut(
+            id=s.id,
+            machine_id=s.machine_id,
+            machine_name=machine_name,
+            driver_name=driver_name,
+            cost_center_name=cost_center_name,
+            started_at=s.started_at,
+            ended_at=s.ended_at,
+            status=s.status,
+            points_count=int(points_count or 0),
         )
-    return out
+        for (s, machine_name, driver_name, cost_center_name, points_count) in rows
+    ]
 
 
 @router.get("/sessions_active", response_model=List[SessionSummaryOut])
 def list_active_sessions(db: Session = Depends(get_db)):
-    subq = (
-        db.query(
-            TrackingPoint.session_id.label("session_id"),
-            func.count(TrackingPoint.id).label("points_count"),
-        )
-        .group_by(TrackingPoint.session_id)
-        .subquery()
-    )
-
     rows = (
         db.query(
             TrackingSession,
             Machine.name.label("machine_name"),
             Driver.name.label("driver_name"),
             CostCenter.name.label("cost_center_name"),
-            func.coalesce(subq.c.points_count, 0).label("points_count"),
+            TrackingSession.points_count.label("points_count"),
         )
         .outerjoin(Machine, TrackingSession.machine_id == Machine.id)
         .outerjoin(Driver, TrackingSession.driver_id == Driver.id)
         .outerjoin(CostCenter, TrackingSession.cost_center_id == CostCenter.id)
-        .outerjoin(subq, subq.c.session_id == TrackingSession.id)
         .filter(TrackingSession.status == TrackingStatus.open)
         .order_by(TrackingSession.started_at.desc())
         .all()
     )
 
-    result: List[SessionSummaryOut] = []
-    for s, machine_name, driver_name, cost_center_name, points_count in rows:
-        result.append(
-            SessionSummaryOut(
-                id=s.id,
-                machine_id=s.machine_id,
-                machine_name=machine_name,
-                driver_name=driver_name,
-                cost_center_name=cost_center_name,
-                started_at=s.started_at,
-                ended_at=s.ended_at,
-                status=s.status,
-                points_count=int(points_count or 0),
-            )
+    return [
+        SessionSummaryOut(
+            id=s.id,
+            machine_id=s.machine_id,
+            machine_name=machine_name,
+            driver_name=driver_name,
+            cost_center_name=cost_center_name,
+            started_at=s.started_at,
+            ended_at=s.ended_at,
+            status=s.status,
+            points_count=int(points_count or 0),
         )
-    return result
+        for (s, machine_name, driver_name, cost_center_name, points_count) in rows
+    ]
 
 
 @router.get("/sessions/{session_id:uuid}/points_range", response_model=List[TrackingPointOut])
