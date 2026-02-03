@@ -2,7 +2,7 @@ from typing import List, Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-
+from decimal import Decimal
 from app.db.session import get_db
 from app.models.machines import Machine
 from app.models.work_orders import WorkOrder
@@ -13,6 +13,70 @@ from app.core.utils import haversine_m
 
 router = APIRouter(prefix="", tags=["machines"])
 
+def _to_float(x):
+    if x is None:
+        return None
+    if isinstance(x, Decimal):
+        return float(x)
+    return float(x)
+
+def normalize_machine_consumption_for_create(payload: MachineCreate) -> dict:
+    data = payload.model_dump()
+
+    unit = data.get("fuel_consumption_unit") or "lph"
+
+    # Backward compatibility: si viene lpkm y no viene kmpl, convierto a km/L
+    lpkm = data.get("fuel_consumption_lpkm")
+    if lpkm is not None and data.get("fuel_efficiency_kmpl") is None:
+        if lpkm <= 0:
+            raise HTTPException(status_code=422, detail="fuel_consumption_lpkm debe ser > 0 para convertir a km/L.")
+        data["fuel_efficiency_kmpl"] = 1.0 / float(lpkm)
+        data["fuel_consumption_unit"] = "kmpl"
+        unit = "kmpl"
+
+    # Consistencia final
+    if unit == "lph":
+        data["fuel_efficiency_kmpl"] = None
+    else:  # kmpl
+        data["fuel_consumption_lph"] = None
+
+    return data
+
+def normalize_machine_consumption_for_update(machine: Machine, payload: MachineUpdate) -> dict:
+    # OJO: exclude_unset para no pisar campos no enviados
+    data = payload.model_dump(exclude_unset=True)
+
+    # Determinar unidad final: payload o DB
+    unit = data.get("fuel_consumption_unit") or (machine.fuel_consumption_unit or "lph")
+
+    # Si viene legacy lpkm, convierto a km/L si no vino kmpl explícito
+    if "fuel_consumption_lpkm" in data and "fuel_efficiency_kmpl" not in data:
+        lpkm = data.get("fuel_consumption_lpkm")
+        if lpkm is not None:
+            if lpkm <= 0:
+                raise HTTPException(status_code=422, detail="fuel_consumption_lpkm debe ser > 0 para convertir a km/L.")
+            data["fuel_efficiency_kmpl"] = 1.0 / float(lpkm)
+            data["fuel_consumption_unit"] = "kmpl"
+            unit = "kmpl"
+
+    # Si el usuario setea ambos en el mismo update, rechazar
+    if "fuel_consumption_lph" in data and "fuel_efficiency_kmpl" in data:
+        if data.get("fuel_consumption_lph") is not None and data.get("fuel_efficiency_kmpl") is not None:
+            raise HTTPException(status_code=422, detail="No puedes enviar fuel_consumption_lph y fuel_efficiency_kmpl a la vez.")
+
+    # Si se definió/confirmó unidad, limpiar el campo opuesto
+    if unit == "lph":
+        # si el update trae unit=lph, o si venía lph, kmpl debe quedar null
+        data["fuel_efficiency_kmpl"] = None
+    else:  # kmpl
+        data["fuel_consumption_lph"] = None
+
+    # Asegurar que quede grabada la unidad final si el payload la envió o si convertimos
+    if "fuel_consumption_unit" in data or payload.fuel_consumption_lpkm is not None:
+        data["fuel_consumption_unit"] = unit
+
+    return data
+
 
 @router.get("/machines", response_model=List[MachineOut])
 def list_machines(db: Session = Depends(get_db)):
@@ -21,17 +85,25 @@ def list_machines(db: Session = Depends(get_db)):
 
 @router.post("/machines", response_model=MachineOut)
 def create_machine(payload: MachineCreate, db: Session = Depends(get_db)):
+    data = normalize_machine_consumption_for_create(payload)
+
     machine = Machine(
-        external_id=payload.external_id,
-        name=payload.name,
-        plate=payload.plate,
-        description=payload.description,
-        cost_center_id=payload.cost_center_id,
-        tank_capacity_liters=payload.tank_capacity_liters,
-        fuel_consumption_lph=payload.fuel_consumption_lph,
-        fuel_consumption_lpkm=payload.fuel_consumption_lpkm,
-        default_activity_id=payload.default_activity_id,
-        default_labor_id=payload.default_labor_id,
+        external_id=data.get("external_id"),
+        name=data["name"],
+        plate=data.get("plate"),
+        description=data.get("description"),
+        cost_center_id=data.get("cost_center_id"),
+        tank_capacity_liters=data.get("tank_capacity_liters"),
+
+        fuel_consumption_unit=data.get("fuel_consumption_unit") or "lph",
+        fuel_consumption_lph=data.get("fuel_consumption_lph"),
+        fuel_efficiency_kmpl=data.get("fuel_efficiency_kmpl"),
+
+        # legacy lo puedes seguir guardando si quieres (yo lo dejaría tal cual llegue)
+        fuel_consumption_lpkm=data.get("fuel_consumption_lpkm"),
+
+        default_activity_id=data.get("default_activity_id"),
+        default_labor_id=data.get("default_labor_id"),
         created_at=datetime.utcnow(),
     )
     db.add(machine)
@@ -46,7 +118,8 @@ def update_machine(machine_id: int, payload: MachineUpdate, db: Session = Depend
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
 
-    data = payload.model_dump(exclude_unset=True)
+    data = normalize_machine_consumption_for_update(machine, payload)
+
     for field, value in data.items():
         setattr(machine, field, value)
 
