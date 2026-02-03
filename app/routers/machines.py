@@ -1,6 +1,6 @@
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 from decimal import Decimal
 from app.db.session import get_db
@@ -111,6 +111,37 @@ def create_machine(payload: MachineCreate, db: Session = Depends(get_db)):
     db.refresh(machine)
     return machine
 
+@router.delete("/machines/{machine_id}")
+def delete_machine(machine_id: int, db: Session = Depends(get_db)):
+    machine = db.query(Machine).get(machine_id)
+    if not machine:
+        raise HTTPException(status_code=404, detail="Machine not found")
+
+    # Bloqueo si hay relaciones (evita borrar y dejar data huérfana)
+    has_work_orders = (
+        db.query(WorkOrder.id)
+        .filter(WorkOrder.machine_id == machine_id)
+        .first()
+        is not None
+    )
+
+    has_sessions = (
+        db.query(TrackingSession.id)
+        .filter(TrackingSession.machine_id == machine_id)
+        .first()
+        is not None
+    )
+
+    if has_work_orders or has_sessions:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete machine: it has related work orders or sessions."
+        )
+
+    db.delete(machine)
+    db.commit()
+
+    return {"deleted": True, "id": machine_id}
 
 @router.put("/machines/{machine_id}", response_model=MachineOut)
 def update_machine(machine_id: int, payload: MachineUpdate, db: Session = Depends(get_db)):
