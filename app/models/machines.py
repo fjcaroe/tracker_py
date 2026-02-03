@@ -1,8 +1,7 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, TIMESTAMP, ForeignKey, Numeric
-from sqlalchemy.orm import relationship
 
 from app.db.base import Base
 
+from sqlalchemy import Column, Integer, String, Text, Boolean, TIMESTAMP, ForeignKey, Numeric
 
 class Machine(Base):
     __tablename__ = "machines"
@@ -17,9 +16,16 @@ class Machine(Base):
     created_at = Column(TIMESTAMP(timezone=True))
 
     tank_capacity_liters = Column(Numeric(10, 2))
+
+    # unidad: 'lph' o 'kmpl'
+    fuel_consumption_unit = Column(String(8), nullable=False, default="lph")
+
+    # valores posibles según unidad
     fuel_consumption_lph = Column(Numeric(10, 2))
+    fuel_efficiency_kmpl = Column(Numeric(10, 4))
+
+    # antiguo (si decides dejarlo)
     fuel_consumption_lpkm = Column(Numeric(10, 3))
+
     default_activity_id = Column(Integer, ForeignKey("activities.id"))
     default_labor_id = Column(Integer, ForeignKey("labors.id"))
-
-    cost_center = relationship("CostCenter")
