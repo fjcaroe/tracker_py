@@ -157,9 +157,13 @@ def update_field(field_id: int, payload: FieldUpdate, db: Session = Depends(get_
     data = payload.model_dump(exclude_unset=True)
 
     # polygon (si viene)
-    if "polygon" in data:
-        _validate_polygon_or_400(data["polygon"])
-        field.polygon = [p.model_dump() for p in data["polygon"]] if data["polygon"] is not None else field.polygon
+    fields_set = payload.model_fields_set
+
+    if "polygon" in fields_set:
+        _validate_polygon_or_400(payload.polygon)
+        if payload.polygon is not None:
+            field.polygon = [p.model_dump() for p in payload.polygon]
+
 
     # cost_center_id (si viene)
     if "cost_center_id" in data:
