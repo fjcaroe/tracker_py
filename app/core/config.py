@@ -13,6 +13,8 @@ class Settings:
     ALLOWED_ORIGINS = [
         "https://www.stepsconsulting.cl",
         "https://stepsconsulting.cl",
+        "https://www.stepsapp.cl",
+        "https://stepsapp.cl",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3005",
